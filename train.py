@@ -9,7 +9,6 @@ from pathlib import Path
 from threading import Thread
 
 import numpy as np
-import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,63 +23,21 @@ from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
-from models.yolo import Model
+from models.yolo_search import Model, parse_model
 from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader_search, create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
-    fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
+    fitness, strip_optimizer_search, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
 from utils.loss import ComputeLoss
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
-from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
+from utils.torch_utils import EMA, ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
+
+from architect import Architect
 
 logger = logging.getLogger(__name__)
 
-def search_ckpt_process(search_ckpt, model_ckpt, cfg):
-    print("Processing search ckpt parameters")
-    conv_dilation = []
-    with open(cfg) as f:
-      cfg = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
-    for i, (f, n, m, args) in enumerate(cfg['backbone'] + cfg['head']):  # from, number, module, args
-      if m in ['Conv', 'C3', 'Bottleneck']:
-        dilation = args[2]
-        if isinstance(dilation, int): conv_dilation.append(dilation)
-        elif isinstance(dilation, list): conv_dilation.extend(dilation)
-        else: raise(ValueError("Something went wrong"))
-
-    conv_list = []
-    ckpt = {}
-    for k in model_ckpt.keys():
-      if k not in search_ckpt.keys():
-        conv_list.append(k)
-        print(k)
-      else: ckpt[k] = search_ckpt[k]
-    assert(len(conv_list)==len(conv_dilation))
-    search_conv_list = []
-    for k in conv_list:
-      tmp = k.split('.')
-      assert(tmp[-2]=='conv')
-      tmp.pop(-2)
-      search_conv_list.append('.'.join(tmp))
-    for key, key_search, d in zip(conv_list, search_conv_list, conv_dilation):
-      p = search_ckpt[key_search]
-      c1, c2, k, _ = model_ckpt[key].shape
-      _,_,ks,_ = p.shape
-      tmp_ks = (k-1)*d + 1
-      start = int((ks - tmp_ks) / 2)
-      end = int(ks - start)
-      ckpt[key] = p[:c1, :c2, start:end:d, start:end:d]
-
-    # deal with channel
-    for k in model_ckpt.keys():
-      p = model_ckpt[k]
-      if len(p.shape) == 1: # bias or w of BN
-        c = p.shape[0]; ckpt[k] = ckpt[k][:c]
-      elif len(p.shape) == 4: # w of Conv
-        cout, cin = p.shape[0:2]; ckpt[k] = ckpt[k][:cout, :cin, :, :]
-      # TODO for concat
-    return ckpt
 
 def train(hyp, opt, device, tb_writer=None, wandb=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
@@ -90,6 +47,10 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     # Directories
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)  # make dir
+    geno_dir = save_dir / 'genotypes'
+    geno_dir.mkdir(parents=True, exist_ok=True)  # make dir
+    alpha_dir = save_dir / 'alphas'
+    alpha_dir.mkdir(parents=True, exist_ok=True)  # make dir
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
@@ -115,31 +76,22 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
-    if opt.train_type == 'from_scratch':
-      pretrained = weights.endswith('.pt')
-      if pretrained:
-#          with torch_distributed_zero_first(rank):
-#              attempt_download(weights)  # download if not found locally
-          ckpt = torch.load(weights, map_location=device)  # load checkpoint
-          model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-          exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
-          state_dict = ckpt['model'].float().state_dict()  # to FP32
-          state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-          model.load_state_dict(state_dict, strict=False)  # load
-          logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
-      else:
-          model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-    elif opt.train_type == 'load_from_search':
-      pretrained = None
-      weights = os.path.join(opt.project, 'exp/weights/best.pt')
-      ckpt = torch.load(weights, map_location=device)  # load checkpoint
-      model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-      state_dict = ckpt['model'].float().state_dict()  # to FP32
-      state_dict = search_ckpt_process(state_dict, model.state_dict(), opt.cfg)  # intersect
-      model.load_state_dict(state_dict, strict=True)  # load
-      logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
-    else: raise(ValueError("No such train_type as %s"%opt.train_type))
-#    assert 0
+    pretrained = weights.endswith('.pt')
+    if pretrained:
+        with torch_distributed_zero_first(rank):
+            attempt_download(weights)  # download if not found locally
+        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
+        state_dict = ckpt['model'].float().state_dict()  # to FP32
+        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
+        model.load_state_dict(state_dict, strict=False)  # load
+        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+    else:
+        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+#    model.update_arch_parameters() # Since to(device) will not update model._arch_parameters
+#    for alpha in model.arch_parameters():
+#        alpha.requires_grad_(True)
 
     # Freeze
     freeze = []  # parameter names to freeze (full or partial)
@@ -150,7 +102,9 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             v.requires_grad = False
 
     # Optimizer
-    nbs = total_batch_size  # nominal batch size
+#    nbs = 64  # nominal batch size
+#    nbs = total_batch_size  # nominal batch size
+    nbs = max(total_batch_size, 64)  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
@@ -159,10 +113,26 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     for k, v in model.named_modules():
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
             pg2.append(v.bias)  # biases
-        if isinstance(v, nn.BatchNorm2d):
+        if isinstance(v, nn.BatchNorm2d) and hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
             pg0.append(v.weight)  # no decay
         elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
             pg1.append(v.weight)  # apply decay
+        elif hasattr(v, 'depth_weight') and isinstance(v.depth_weight, nn.Parameter):
+            pg1.append(v.depth_weight)  # apply decay
+            if hasattr(v, 'point_weight') and isinstance(v.point_weight, nn.Parameter): pg1.append(v.point_weight)  # apply decay
+        elif hasattr(v, 'depth_weight1') and isinstance(v.depth_weight1, nn.Parameter):
+            pg1.append(v.depth_weight1)  # apply decay
+        elif hasattr(v, 'depth_weight2') and isinstance(v.depth_weight2, nn.Parameter):
+            pg1.append(v.depth_weight2)  # apply decay
+
+    tt = 0
+    for w in model.parameters(): tt+=1
+    assert (tt == len(pg0)+len(pg1)+len(pg2))
+#    # Test genotype code
+#    geno, model_yaml = model.genotype()
+#    parse_model(model_yaml, [3])
+#    print(geno)
+#    assert 0
 
     if opt.adam:
         optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
@@ -184,17 +154,27 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # Logging
-    if rank in [-1, 0] and wandb and wandb.run is None:
+    if rank in [-1, 0] and wandb and (not hasattr(wandb, 'run') or wandb.run is None):
         opt.hyp = hyp  # add hyperparameters
-        wandb_run = wandb.init(config=opt, resume="allow",
-                               project='YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem,
-                               name=save_dir.stem,
-                               entity=opt.entity,
-                               id=ckpt.get('wandb_id') if 'ckpt' in locals() else None)
-    loggers = {'wandb': wandb}  # loggers dict
+        try:
+            wandb_run = wandb.init(
+                config=opt, 
+                resume="allow",
+                project='YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem,
+                name=save_dir.stem,
+                entity=opt.entity,
+                id=ckpt.get('wandb_id') if 'ckpt' in locals() else None
+            )
+        except wandb.errors.UsageError as e:
+            print(f"Wandb init failed: {e}. Disabling wandb logging.")
+            wandb_run = None
+    else:
+        wandb_run = None
 
+    loggers = {'wandb': wandb_run}  # loggers dict
     # EMA
-    ema = ModelEMA(model) if rank in [-1, 0] else None
+#    ema = ModelEMA(model) if rank in [-1, 0] else None
+    ema = EMA(model) if rank in [-1, 0] else None
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
@@ -206,7 +186,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
         # EMA
         if ema and ckpt.get('ema'):
-            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
+#            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
+            ema.shadow = ckpt['ema']
             ema.updates = ckpt['updates']
 
         # Results
@@ -243,11 +224,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+    dataloader, dataloader_val, dataset, dataset_val = create_dataloader_search(train_path, imgsz, batch_size, gs, opt,
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
-    mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
+                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '), train_portion=opt.train_portion)
+    mlc = np.concatenate(dataset.dataset.labels, 0)[:, 0].max()  # max label class. dataset is an instance of torch.utils.data.Subset
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
@@ -257,13 +238,9 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                        world_size=opt.world_size, workers=opt.workers,
                                        pad=0.5, prefix=colorstr('val: '))[0]
-#        img = torch.zeros((1, model.yaml.get('ch', 3), imgsz, imgsz), device=next(model.parameters()).device)  # input
-#        model.eval()
-#        model.forward_once(img, profile=True)
-#        model.train()
 
         if not opt.resume:
-            labels = np.concatenate(dataset.labels, 0)
+            labels = np.concatenate(dataset.dataset.labels, 0)
             c = torch.tensor(labels[:, 0])  # classes
             # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
             # model._initialize_biases(cf.to(device))
@@ -274,8 +251,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
             # Anchors
             if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
-            model.half().float()  # pre-reduce anchor precision 
+                check_anchors(dataset.dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+#            model.half().float()  # pre-reduce anchor precision 
 
     # Model parameters
     hyp['box'] *= 3. / nl  # scale to layers
@@ -284,7 +261,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    model.class_weights = labels_to_class_weights(dataset.dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
     # Start training
@@ -300,6 +277,14 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
+
+    # Architect for NAS
+    architect = Architect(model, compute_loss, accumulate, device, opt, DDP=torch.cuda.device_count()>1)
+    ori_model = model.module if is_parallel(model) else model
+    ori_model.display_alphas()
+
+#    torch.autograd.set_detect_anomaly(True)
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -308,14 +293,19 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             # Generate indices
             if rank in [-1, 0]:
                 cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
-                iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
-                dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
+                iw = labels_to_image_weights(dataset.dataset.labels, nc=nc, class_weights=cw)  # image weights
+                dataset.indices = random.choices(range(len(dataset.indices)), weights=iw[:len(dataset.indices)], k=len(dataset.indices))  # rand weighted idx
+                dataset_val.indices = random.choices(range(len(dataset_val.indices)), weights=iw[-len(dataset_val.indices):], k=len(dataset_val.indices))  # rand weighted idx
             # Broadcast if DDP
             if rank != -1:
-                indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
+                indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(len(dataset.indices))).int()
                 dist.broadcast(indices, 0)
                 if rank != 0:
                     dataset.indices = indices.cpu().numpy()
+                indices = (torch.tensor(dataset_val.indices) if rank == 0 else torch.zeros(len(dataset_val.indices))).int()
+                dist.broadcast(indices, 0)
+                if rank != 0:
+                    dataset_val.indices = indices.cpu().numpy()
 
         # Update mosaic border
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
@@ -324,11 +314,18 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         mloss = torch.zeros(4, device=device)  # mean losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
+            dataloader_val.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'targets', 'img_size'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
+
+        def valid_generator():
+            while True:
+              for x, t, path, shape in dataloader_val:
+                yield x, t, path, shape
+        valid_gen = valid_generator()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
@@ -352,6 +349,21 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
+            # architect
+            if epoch >= opt.search_warmup:
+#              input_valid = imgs
+#              target_valid = targets
+              input_valid, target_valid, _, _ = next(valid_gen)
+              input_valid = input_valid.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+              # Multi-scale
+              if opt.multi_scale:
+                  sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
+                  sf = sz / max(input_valid.shape[2:])  # scale factor
+                  if sf != 1:
+                      ns = [math.ceil(x * sf / gs) * gs for x in input_valid.shape[2:]]  # new shape (stretched to gs-multiple)
+                      input_valid = F.interpolate(input_valid, size=ns, mode='bilinear', align_corners=False)
+              architect.step(input_valid, target_valid)
+
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
@@ -362,7 +374,19 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     loss *= 4.
 
             # Backward
-            scaler.scale(loss).backward()
+#            scaler.scale(loss).backward()
+            grads =  torch.autograd.grad(scaler.scale(loss), model.parameters(), grad_outputs=torch.ones_like(loss), allow_unused=True)
+#            for idx, (name, p) in enumerate(model.named_parameters()):
+#              if grads[idx] is None: print(name)
+#              else: print(grads[idx])
+#            assert 0
+            for v, g in zip(model.parameters(), grads):
+              if v.grad is None:
+                if not (g is None):
+                  v.grad = torch.autograd.Variable(g.data)
+              else:
+                if not (g is None):
+                  v.grad.data.add_(g.data)
 
             # Optimize
             if ni % accumulate == 0:
@@ -370,7 +394,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 scaler.update()
                 optimizer.zero_grad()
                 if ema:
-                    ema.update(model)
+#                    ema.update(model)
+                    ema.update()
 
             # Print
             if rank in [-1, 0]:
@@ -391,7 +416,47 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     wandb.log({"Mosaics": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('train*.jpg')
                                            if x.exists()]}, commit=False)
 
+#            # test whether the model in architect and ema is updated
+#            state_dict_m = model.state_dict()
+#            state_dict_a = architect.model.state_dict()
+#            state_dict_e = ema.model.state_dict()
+#            for key in state_dict_m.keys():
+#              print((state_dict_m[key]-state_dict_a[key]).sum())
+#              print((state_dict_m[key]-state_dict_e[key]).sum())
+#            model.display_alphas()
+
             # end batch ------------------------------------------------------------------------------------------------
+        # DDP process 0 or single-GPU
+        if rank in [-1, 0]:
+          # save alpha
+          alpha_file = os.path.join(alpha_dir, '%d.yaml'%epoch)
+          alphas_yaml = {}
+          state_dict = ori_model.state_dict()
+          for key in state_dict.keys():
+            if 'alpha' in key:
+              alphas_yaml[key] = state_dict[key].data.cpu().numpy().tolist()
+          with open(alpha_file, encoding='utf-8', mode='w') as f:
+            try:
+                yaml.dump(data=alphas_yaml, stream=f, allow_unicode=True)
+            except Exception as e:
+                print(e)
+          
+          geno, model_yaml = ori_model.genotype()
+          # save genotype
+          geno_file = os.path.join(geno_dir, '%d.yaml'%epoch)
+          with open(geno_file, encoding='utf-8', mode='w') as f:
+            try:
+                yaml.dump(data=model_yaml, stream=f, allow_unicode=True)
+            except Exception as e:
+                print(e)
+          print("==================")
+          print("normalized alphas:")
+          ori_model.display_alphas()
+          print('genotype:')
+          for g in geno:
+            print(g)
+          print("==================")
+        
         # end epoch ----------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -401,13 +466,15 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
             # mAP
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
+#            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
+                ema.apply_shadow()
                 results, maps, times = test.test(opt.data,
                                                  batch_size=batch_size * 2,
                                                  imgsz=imgsz_test,
-                                                 model=ema.ema,
+#                                                 model=ema.ema,
+                                                 model=model.module if is_parallel(model) else model,
                                                  single_cls=opt.single_cls,
                                                  dataloader=testloader,
                                                  save_dir=save_dir,
@@ -415,11 +482,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                                  plots=plots and final_epoch,
                                                  log_imgs=opt.log_imgs if wandb else 0,
                                                  compute_loss=compute_loss)
+                ema.restore()
 
             # Write
             with open(results_file, 'a') as f:
                 f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
-            logger.info(s + '%10.4g' * 7 % results)  # append metrics, val_loss
             if len(opt.name) and opt.bucket:
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
 
@@ -444,19 +511,19 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
                         'training_results': results_file.read_text(),
-                        'model': deepcopy(model.module if is_parallel(model) else model),
-                        'ema': deepcopy(ema.ema),
-#                        'model': deepcopy(model.module if is_parallel(model) else model),
-#                        'ema': deepcopy(ema.ema),
+#                        'model': (model.module if is_parallel(model) else model).half(),
+                        'model': model.module if is_parallel(model) else model,
+#                        'ema': deepcopy(ema.ema).half(),
+                        'ema': ema.shadow,
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_run.id if wandb else None}
-
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
                 del ckpt
+                model.float()
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
@@ -467,7 +534,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         for f in last, best:
             if f.exists():
                 tmp = f.with_name('stripped_%s'%f.name)
-                strip_optimizer(f, s=tmp)
+                strip_optimizer_search(f, s=tmp)
         if opt.bucket:
             os.system(f'gsutil cp {final} gs://{opt.bucket}/weights')  # upload
 
@@ -483,16 +550,18 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
         # Test best.pt
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+#        best = best.with_name('stripped_%s'%best.name)
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
             for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                m = m.with_name('stripped_%s'%m.name)
+                stripped_m = m.with_name('stripped_%s'%m.name)
+                print(stripped_m)
                 results, _, _ = test.test(opt.data,
                                           batch_size=batch_size * 2,
                                           imgsz=imgsz_test,
                                           conf_thres=0.001,
                                           iou_thres=0.7,
-                                          model=attempt_load(m, device),
-#                                          model=attempt_load(m, device),
+#                                          model=attempt_load(stripped_m, device).half(),
+                                          model=attempt_load(stripped_m, device),
                                           single_cls=opt.single_cls,
                                           dataloader=testloader,
                                           save_dir=save_dir,
@@ -541,8 +610,16 @@ if __name__ == '__main__':
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
 
-    parser.add_argument('--train_type', type=str, default='from_scratch', help='training type')
+    # For NAS
+    parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
+    parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
+    parser.add_argument('--search_warmup', type=int, default=0, help='Epoch to Warmup the operation weights')
+    parser.add_argument('--train_portion', type=float, default=0.5, help='portion to split the train set and search set')
+
     opt = parser.parse_args()
+    opt.project = '{}-{}'.format(opt.project, time.strftime("%Y%m%d-%H%M%S"))
+    print("Experiments dir: %s"%opt.project)
+    print("cfg file: %s"%opt.cfg)
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
